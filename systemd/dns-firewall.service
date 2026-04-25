@@ -1,0 +1,20 @@
+[Unit]
+Description=DNS TXT iptables allowlist synchronizer
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dns-firewall --config /etc/dns-firewall/config.json
+Restart=on-failure
+RestartSec=10s
+SyslogIdentifier=dns-firewall
+StandardOutput=journal
+StandardError=journal
+
+# iptables and ip6tables need root privileges.
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

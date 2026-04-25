@@ -1,0 +1,15 @@
+{
+  "poll_interval": "5m",
+  "dry_run": false,
+  "nameservers": [
+    "1.1.1.1",
+    "8.8.8.8"
+  ],
+  "records": [
+    "_allowlist.example.com",
+    "_admins.example.net"
+  ],
+  "firewall": {
+    "chain": "DNS_FIREWALL_ALLOW"
+  }
+}

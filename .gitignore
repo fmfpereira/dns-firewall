@@ -1,0 +1,35 @@
+# Build artifacts
+/dns-firewall
+/bin/
+/dist/
+/build/
+*.test
+*.out
+
+# Go test and coverage output
+coverage.out
+coverage.html
+*.coverprofile
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+/config/*.json
+!/config/*.json.example
+
+# Logs and runtime files
+*.log
+*.pid
+tmp/
+temp/
+
+# Editor and tool state
+.idea/
+.vscode/
+.claude/
+.codex
+
+# OS metadata
+.DS_Store
+Thumbs.db
