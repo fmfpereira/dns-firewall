@@ -55,18 +55,84 @@ Edit `/etc/dns-firewall/config.json`:
 
 The only configurable firewall setting is the managed chain name. The service always attaches that chain to `INPUT` at position `1`, manages both IPv4 and IPv6, and keeps existing allowlist rules if DNS lookup fails or resolves to no addresses.
 
-## Test A Sync
+## Install From A Release
+
+Download the release tarball for your machine from the GitHub Releases page.
+
+Release assets use these names:
+
+```text
+dns-firewall_<version>_linux_amd64.tar.gz
+dns-firewall_<version>_linux_arm64.tar.gz
+dns-firewall_<version>_linux_armv7.tar.gz
+checksums.txt
+```
+
+Example for `linux_amd64`:
+
+```bash
+VERSION=v0.1.0
+curl -LO "https://github.com/<owner>/dns-firewall/releases/download/${VERSION}/dns-firewall_${VERSION}_linux_amd64.tar.gz"
+curl -LO "https://github.com/<owner>/dns-firewall/releases/download/${VERSION}/checksums.txt"
+sha256sum -c checksums.txt --ignore-missing
+tar -xzf "dns-firewall_${VERSION}_linux_amd64.tar.gz"
+```
+
+Install the release files:
+
+```bash
+sudo install -m 0755 dns-firewall /usr/local/bin/dns-firewall
+sudo mkdir -p /etc/dns-firewall
+sudo install -m 0644 dns-firewall.json.example /etc/dns-firewall/config.json
+sudo install -m 0644 dns-firewall.service /etc/systemd/system/dns-firewall.service
+```
+
+Edit `/etc/dns-firewall/config.json` before starting the service.
+
+## Build From Source
+
+Build and install locally:
+
+```bash
+go build -o dns-firewall ./cmd/dns-firewall
+sudo install -m 0755 dns-firewall /usr/local/bin/dns-firewall
+```
+
+Install the example config and systemd unit from the source tree:
+
+```bash
+sudo mkdir -p /etc/dns-firewall
+sudo cp config/dns-firewall.json.example /etc/dns-firewall/config.json
+sudo cp systemd/dns-firewall.service /etc/systemd/system/dns-firewall.service
+```
+
+Edit `/etc/dns-firewall/config.json` before starting the service.
+
+## Run The Service
 
 Run a dry-run without touching iptables:
 
 ```bash
-go run ./cmd/dns-firewall --config config/dns-firewall.json.example --once --dry-run
+sudo dns-firewall --config /etc/dns-firewall/config.json --once --dry-run
 ```
 
-Apply rules for real:
+Apply rules once:
 
 ```bash
 sudo dns-firewall --config /etc/dns-firewall/config.json --once
+```
+
+Start the systemd service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now dns-firewall.service
+```
+
+Check logs:
+
+```bash
+sudo journalctl -u dns-firewall.service -f
 ```
 
 The service creates a dedicated chain and inserts a jump to it from `INPUT`:
@@ -77,29 +143,6 @@ DNS_FIREWALL_ALLOW -s <resolved-ip> -j ACCEPT
 ```
 
 It updates only `DNS_FIREWALL_ALLOW`, using `iptables-restore --noflush` / `ip6tables-restore --noflush` so the managed chain rewrite is applied as one transaction.
-
-## Install As A Linux Service
-
-Build and install the binary:
-
-```bash
-go build -o dns-firewall ./cmd/dns-firewall
-sudo install -m 0755 dns-firewall /usr/local/bin/dns-firewall
-```
-
-Install and start the systemd unit:
-
-```bash
-sudo cp systemd/dns-firewall.service /etc/systemd/system/dns-firewall.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now dns-firewall.service
-```
-
-Check logs:
-
-```bash
-sudo journalctl -u dns-firewall.service -f
-```
 
 ## Logging
 

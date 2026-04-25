@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: Check formatting
+        run: |
+          files="$(gofmt -l cmd internal)"
+          test -z "$files" || (echo "$files" && exit 1)
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Cross-compile check
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          GOOS=linux GOARCH=arm64 go build ./...
+          GOOS=linux GOARCH=arm GOARM=7 go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Staticcheck
+        uses: dominikh/staticcheck-action@9716614d4101e79b4340dd97b10e54d68234e431 # v1.4.1
+        with:
+          version: "2025.1.1"
+          install-go: false
+
+      - name: Govulncheck
+        uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee # v1.0.4
+        with:
+          go-version-input: "1.24.x"

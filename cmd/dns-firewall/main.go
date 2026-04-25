@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -15,12 +16,20 @@ import (
 	"dns-firewall/internal/firewall"
 )
 
+var version = "dev"
+
 func main() {
 	configPath := flag.String("config", "/etc/dns-firewall/config.json", "path to configuration file")
 	once := flag.Bool("once", false, "run one sync and exit")
 	dryRun := flag.Bool("dry-run", false, "log firewall commands without applying them")
 	verbose := flag.Bool("verbose", false, "enable debug logging")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	level := slog.LevelInfo
 	if *verbose {
