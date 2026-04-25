@@ -119,3 +119,7 @@ The daemon logs DNS lookup failures by nameserver and reason, including record-n
 ```bash
 go test ./...
 ```
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
