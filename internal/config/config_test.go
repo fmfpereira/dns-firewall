@@ -15,7 +15,8 @@ func TestLoadConfig(t *testing.T) {
   "nameservers": ["1.1.1.1", "8.8.8.8:53"],
   "records": ["_allow.example.com"],
   "firewall": {
-    "chain": "DNS_FW"
+    "chain": "DNS_FW",
+    "interfaces": ["eth0"]
   }
 }`)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
@@ -32,6 +33,9 @@ func TestLoadConfig(t *testing.T) {
 	if cfg.Firewall.Chain != "DNS_FW" {
 		t.Fatalf("got chain %q", cfg.Firewall.Chain)
 	}
+	if len(cfg.Firewall.Interfaces) != 1 || cfg.Firewall.Interfaces[0] != "eth0" {
+		t.Fatalf("got interfaces %v", cfg.Firewall.Interfaces)
+	}
 	if len(cfg.Records) != 1 || cfg.Records[0] != "_allow.example.com" {
 		t.Fatalf("got records %v", cfg.Records)
 	}
@@ -46,6 +50,7 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
   "records": ["_allow.example.com"],
   "firewall": {
     "chain": "DNS_FW",
+    "interfaces": ["eth0"],
     "ipv4": true
   }
 }`)
@@ -61,13 +66,32 @@ func TestLoadRejectsInvalidChainName(t *testing.T) {
   "poll_interval": "1m",
   "records": ["_allow.example.com"],
   "firewall": {
-    "chain": "DNS FW"
+    "chain": "DNS FW",
+    "interfaces": ["eth0"]
   }
 }`)
 
 	_, err := Load(path)
 	if err == nil || !strings.Contains(err.Error(), "firewall.chain") {
 		t.Fatalf("got error %v, want firewall.chain validation error", err)
+	}
+}
+
+func TestLoadAllowsMissingInterfaces(t *testing.T) {
+	path := writeConfig(t, `{
+  "poll_interval": "1m",
+  "records": ["_allow.example.com"],
+  "firewall": {
+    "chain": "DNS_FW"
+  }
+}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Firewall.Interfaces) != 0 {
+		t.Fatalf("got interfaces %v, want none", cfg.Firewall.Interfaces)
 	}
 }
 

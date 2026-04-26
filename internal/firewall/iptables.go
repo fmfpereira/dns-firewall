@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"dns-firewall/internal/config"
 	"dns-firewall/internal/dns"
@@ -23,8 +24,9 @@ type commandError struct {
 }
 
 type Manager struct {
-	config config.FirewallConfig
-	dryRun bool
+	config    config.FirewallConfig
+	dryRun    bool
+	commandFn func(ctx context.Context, binary string, args ...string) (string, error)
 }
 
 const (
@@ -37,6 +39,10 @@ func NewManager(cfg config.FirewallConfig, dryRun bool) *Manager {
 }
 
 func (m *Manager) Apply(ctx context.Context, addresses []dns.AllowedAddress) error {
+	if len(addresses) == 0 {
+		slog.Warn("refusing to apply empty allowlist; keeping existing firewall rules")
+		return nil
+	}
 	if err := m.applyFamily(ctx, "iptables", dns.IPv4, addresses); err != nil {
 		return err
 	}
@@ -47,43 +53,94 @@ func (m *Manager) Apply(ctx context.Context, addresses []dns.AllowedAddress) err
 }
 
 func (m *Manager) applyFamily(ctx context.Context, binary string, family dns.Family, addresses []dns.AllowedAddress) error {
+	interfaces, err := m.effectiveInterfaces(ctx, family)
+	if err != nil {
+		return err
+	}
+	if len(interfaces) == 0 {
+		markNoDefaultRoute(binary, family)
+		return m.removeManagedJumps(ctx, binary)
+	}
+	clearNoDefaultRoute(binary, family)
+
 	if err := m.ensureChain(ctx, binary); err != nil {
 		return err
 	}
-	if err := m.ensureJump(ctx, binary); err != nil {
+	if err := m.ensureJumps(ctx, binary, interfaces); err != nil {
 		return err
 	}
 
 	desired := desiredSources(family, addresses)
-	if !m.dryRun {
-		current, err := m.currentSources(ctx, binary)
-		if err != nil {
-			return err
-		}
-		added, removed := sourceDiff(current, desired)
-		if len(added) == 0 && len(removed) == 0 {
-			slog.Info("firewall already in sync", "binary", binary, "chain", m.config.Chain, "rules", len(desired))
-			return nil
-		}
-		slog.Info(
-			"firewall change detected",
-			"binary", binary,
-			"chain", m.config.Chain,
-			"desired_rules", len(desired),
-			"current_rules", len(current),
-			"added", len(added),
-			"removed", len(removed),
-		)
-		slog.Debug("firewall rule diff", "binary", binary, "added", added, "removed", removed)
-	} else {
+	if m.dryRun {
 		slog.Info("dry-run firewall update planned", "binary", binary, "chain", m.config.Chain, "desired_rules", len(desired))
+		return m.restoreRules(ctx, binary, desired)
 	}
+
+	state, err := m.currentState(ctx, binary)
+	if err != nil {
+		return err
+	}
+	added, removed := sourceDiff(state.sources, desired)
+	if len(added) == 0 && len(removed) == 0 && state.terminalDrop {
+		slog.Info("firewall already in sync", "binary", binary, "chain", m.config.Chain, "rules", len(desired))
+		return nil
+	}
+	slog.Info(
+		"firewall change detected",
+		"binary", binary,
+		"chain", m.config.Chain,
+		"desired_rules", len(desired),
+		"current_rules", len(state.sources),
+		"terminal_drop", state.terminalDrop,
+		"added", len(added),
+		"removed", len(removed),
+	)
+	slog.Debug("firewall rule diff", "binary", binary, "added", added, "removed", removed)
 
 	if err := m.restoreRules(ctx, binary, desired); err != nil {
 		return err
 	}
 	slog.Info("firewall rules updated", "binary", binary, "chain", m.config.Chain, "rules", len(desired))
 	return nil
+}
+
+var (
+	noRouteStateMu sync.Mutex
+	noRouteState   = map[string]bool{}
+)
+
+func markNoDefaultRoute(binary string, family dns.Family) {
+	noRouteStateMu.Lock()
+	defer noRouteStateMu.Unlock()
+	if noRouteState[binary] {
+		slog.Debug("no default-route interface still missing", "binary", binary, "family", family)
+		return
+	}
+	noRouteState[binary] = true
+	slog.Warn("no default-route interface found; removing managed jumps for firewall family", "binary", binary, "family", family)
+}
+
+func clearNoDefaultRoute(binary string, family dns.Family) {
+	noRouteStateMu.Lock()
+	defer noRouteStateMu.Unlock()
+	if !noRouteState[binary] {
+		return
+	}
+	delete(noRouteState, binary)
+	slog.Info("default-route interface restored", "binary", binary, "family", family)
+}
+
+func (m *Manager) effectiveInterfaces(ctx context.Context, family dns.Family) ([]string, error) {
+	if len(m.config.Interfaces) > 0 {
+		return dedupeStrings(m.config.Interfaces), nil
+	}
+	interfaces, err := defaultRouteInterfaces(ctx, family)
+	if err != nil {
+		slog.Error("failed to detect default-route interface", "family", family, "error", err)
+		return nil, err
+	}
+	slog.Info("default-route interfaces detected", "family", family, "interfaces", interfaces)
+	return interfaces, nil
 }
 
 func (m *Manager) ensureChain(ctx context.Context, binary string) error {
@@ -98,17 +155,33 @@ func (m *Manager) ensureChain(ctx context.Context, binary string) error {
 	return err
 }
 
-func (m *Manager) ensureJump(ctx context.Context, binary string) error {
-	_, err := m.command(ctx, binary, "-w", "-C", attachChain, "-j", m.config.Chain)
-	if err == nil {
-		return nil
-	}
-	if !isRuleMissing(err) {
-		slog.Error("failed to check firewall managed chain jump", "binary", binary, "attach_chain", attachChain, "chain", m.config.Chain, "error", err)
+func (m *Manager) ensureJumps(ctx context.Context, binary string, interfaces []string) error {
+	desired := desiredJumpSpecs(m.config.Chain, interfaces)
+	inputRules, err := m.inputRules(ctx, binary)
+	if err != nil {
 		return err
 	}
-	slog.Info("firewall jump missing; inserting managed chain", "binary", binary, "attach_chain", attachChain, "chain", m.config.Chain, "position", insertPosition)
-	return m.run(ctx, binary, "-w", "-I", attachChain, strconv.Itoa(insertPosition), "-j", m.config.Chain)
+
+	if firstRulesMatch(inputRules, desired) {
+		return m.removeStaleJumps(ctx, binary, inputRules[len(desired):], nil)
+	}
+
+	for i, spec := range desired {
+		args := append([]string{"-w", "-I", attachChain, strconv.Itoa(insertPosition + i)}, spec...)
+		slog.Info("inserting firewall managed chain jump", "binary", binary, "attach_chain", attachChain, "chain", m.config.Chain, "position", insertPosition+i, "rule", spec)
+		if err := m.run(ctx, binary, args...); err != nil {
+			return err
+		}
+	}
+
+	postInsertRules, err := m.inputRules(ctx, binary)
+	if err != nil {
+		return err
+	}
+	if len(postInsertRules) <= len(desired) {
+		return nil
+	}
+	return m.removeStaleJumps(ctx, binary, postInsertRules[len(desired):], nil)
 }
 
 func (m *Manager) run(ctx context.Context, binary string, args ...string) error {
@@ -117,7 +190,7 @@ func (m *Manager) run(ctx context.Context, binary string, args ...string) error 
 		return nil
 	}
 
-	output, err := m.command(ctx, binary, args...)
+	output, err := m.exec(ctx, binary, args...)
 	if err != nil {
 		slog.Error("firewall command failed", "binary", binary, "args", args, "output", strings.TrimSpace(output), "error", err)
 		return err
@@ -125,20 +198,70 @@ func (m *Manager) run(ctx context.Context, binary string, args ...string) error 
 	return nil
 }
 
-func (m *Manager) currentSources(ctx context.Context, binary string) ([]string, error) {
-	output, err := m.output(ctx, binary, "-w", "-S", m.config.Chain)
+func (m *Manager) inputRules(ctx context.Context, binary string) ([][]string, error) {
+	output, err := m.output(ctx, binary, "-w", "-S", attachChain)
 	if err != nil {
 		return nil, err
 	}
+	return parseChainRules(output, attachChain), nil
+}
 
+func (m *Manager) removeStaleJumps(ctx context.Context, binary string, rules [][]string, desired [][]string) error {
+	for _, rule := range rules {
+		if !isManagedJump(rule, m.config.Chain) || containsRule(desired, rule) {
+			continue
+		}
+		args := append([]string{"-w", "-D", attachChain}, rule...)
+		slog.Info("removing stale firewall managed chain jump", "binary", binary, "attach_chain", attachChain, "chain", m.config.Chain, "rule", rule)
+		if err := m.run(ctx, binary, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) removeManagedJumps(ctx context.Context, binary string) error {
+	inputRules, err := m.inputRules(ctx, binary)
+	if err != nil {
+		return err
+	}
+	if err := m.removeStaleJumps(ctx, binary, inputRules, nil); err != nil {
+		return err
+	}
+	return m.flushManagedChain(ctx, binary)
+}
+
+func (m *Manager) flushManagedChain(ctx context.Context, binary string) error {
+	_, err := m.command(ctx, binary, "-w", "-F", m.config.Chain)
+	if err == nil || isMissingChain(err) {
+		return nil
+	}
+	slog.Error("failed to flush managed chain", "binary", binary, "chain", m.config.Chain, "error", err)
+	return err
+}
+
+type chainState struct {
+	sources      []string
+	terminalDrop bool
+}
+
+func (m *Manager) currentState(ctx context.Context, binary string) (chainState, error) {
+	output, err := m.output(ctx, binary, "-w", "-S", m.config.Chain)
+	if err != nil {
+		return chainState{}, err
+	}
+	return managedChainState(output, m.config.Chain), nil
+}
+
+func managedChainState(output string, chain string) chainState {
 	seen := map[string]struct{}{}
-	for _, line := range strings.Split(output, "\n") {
-		fields := strings.Fields(line)
+	rules := parseChainRules(output, chain)
+	for _, fields := range rules {
 		for i := 0; i < len(fields)-1; i++ {
 			if fields[i] != "-s" {
 				continue
 			}
-			if !ruleAccepts(fields) {
+			if !ruleJumpsTo(fields, "RETURN") {
 				continue
 			}
 			source := normalizeSource(fields[i+1])
@@ -147,11 +270,14 @@ func (m *Manager) currentSources(ctx context.Context, binary string) ([]string, 
 			}
 		}
 	}
-	return sortedKeys(seen), nil
+	return chainState{
+		sources:      sortedKeys(seen),
+		terminalDrop: len(rules) > 0 && ruleEquals(rules[len(rules)-1], []string{"-j", "DROP"}),
+	}
 }
 
 func (m *Manager) output(ctx context.Context, binary string, args ...string) (string, error) {
-	output, err := m.command(ctx, binary, args...)
+	output, err := m.exec(ctx, binary, args...)
 	if err != nil {
 		slog.Error("firewall command failed", "binary", binary, "args", args, "output", strings.TrimSpace(output), "error", err)
 		return "", err
@@ -162,18 +288,19 @@ func (m *Manager) output(ctx context.Context, binary string, args ...string) (st
 func (m *Manager) restoreRules(ctx context.Context, binary string, sources []string) error {
 	payload := restoreInput(m.config.Chain, sources)
 	restoreBinary := restoreBinaryFor(binary)
+	restoreArgs := restoreArgs()
 	if m.dryRun {
-		slog.Info("dry-run firewall restore command", "command", []string{restoreBinary, "--noflush"}, "input", payload)
+		slog.Info("dry-run firewall restore command", "command", append([]string{restoreBinary}, restoreArgs...), "input", payload)
 		return nil
 	}
 
-	cmd := exec.CommandContext(ctx, restoreBinary, "--noflush")
+	cmd := exec.CommandContext(ctx, restoreBinary, restoreArgs...)
 	cmd.Stdin = strings.NewReader(payload)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		commandErr := commandError{
 			binary: restoreBinary,
-			args:   []string{"--noflush"},
+			args:   restoreArgs,
 			output: string(output),
 			err:    err,
 		}
@@ -188,7 +315,13 @@ func (m *Manager) command(ctx context.Context, binary string, args ...string) (s
 		slog.Info("dry-run firewall command", "command", append([]string{binary}, args...))
 		return "", nil
 	}
+	return m.exec(ctx, binary, args...)
+}
 
+func (m *Manager) exec(ctx context.Context, binary string, args ...string) (string, error) {
+	if m.commandFn != nil {
+		return m.commandFn(ctx, binary, args...)
+	}
 	cmd := exec.CommandContext(ctx, binary, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -213,6 +346,52 @@ func restoreBinaryFor(binary string) string {
 	}
 }
 
+func restoreArgs() []string {
+	return []string{"--wait", "--noflush"}
+}
+
+func defaultRouteInterfaces(ctx context.Context, family dns.Family) ([]string, error) {
+	ipFamily := "-4"
+	if family == dns.IPv6 {
+		ipFamily = "-6"
+	}
+
+	cmd := exec.CommandContext(ctx, "ip", ipFamily, "route", "show", "default")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, commandError{
+			binary: "ip",
+			args:   []string{ipFamily, "route", "show", "default"},
+			output: string(output),
+			err:    err,
+		}
+	}
+	return parseDefaultRouteInterfaces(string(output)), nil
+}
+
+func parseDefaultRouteInterfaces(output string) []string {
+	interfaces := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != "default" {
+			continue
+		}
+		for i := 0; i < len(fields)-1; i++ {
+			if fields[i] != "dev" {
+				continue
+			}
+			iface := fields[i+1]
+			if _, ok := seen[iface]; ok {
+				continue
+			}
+			seen[iface] = struct{}{}
+			interfaces = append(interfaces, iface)
+		}
+	}
+	return interfaces
+}
+
 func restoreInput(chain string, sources []string) string {
 	var builder strings.Builder
 	builder.WriteString("*filter\n")
@@ -224,8 +403,11 @@ func restoreInput(chain string, sources []string) string {
 		builder.WriteString(chain)
 		builder.WriteString(" -s ")
 		builder.WriteString(source)
-		builder.WriteString(" -j ACCEPT\n")
+		builder.WriteString(" -j RETURN\n")
 	}
+	builder.WriteString("-A ")
+	builder.WriteString(chain)
+	builder.WriteString(" -j DROP\n")
 	builder.WriteString("COMMIT\n")
 	return builder.String()
 }
@@ -256,6 +438,15 @@ func isRuleMissing(err error) bool {
 	return strings.Contains(text, "Bad rule") ||
 		strings.Contains(text, "does a matching rule exist") ||
 		strings.Contains(text, "No chain/target/match by that name")
+}
+
+func isMissingChain(err error) bool {
+	var commandErr commandError
+	text := err.Error()
+	if errors.As(err, &commandErr) {
+		text = commandErr.output
+	}
+	return strings.Contains(text, "No chain/target/match by that name")
 }
 
 func desiredSources(family dns.Family, addresses []dns.AllowedAddress) []string {
@@ -309,13 +500,89 @@ func normalizeSource(value string) string {
 	return value
 }
 
-func ruleAccepts(fields []string) bool {
+func ruleJumpsTo(fields []string, target string) bool {
 	for i := 0; i < len(fields)-1; i++ {
-		if fields[i] == "-j" && fields[i+1] == "ACCEPT" {
+		if fields[i] == "-j" && fields[i+1] == target {
 			return true
 		}
 	}
 	return false
+}
+
+func desiredJumpSpecs(chain string, interfaces []string) [][]string {
+	specs := make([][]string, 0, len(interfaces))
+	for _, iface := range interfaces {
+		specs = append(specs, []string{"-i", iface, "-j", chain})
+	}
+	return specs
+}
+
+func dedupeStrings(values []string) []string {
+	deduped := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		deduped = append(deduped, value)
+	}
+	return deduped
+}
+
+func parseChainRules(output string, chain string) [][]string {
+	rules := make([][]string, 0)
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[0] != "-A" || fields[1] != chain {
+			continue
+		}
+		rules = append(rules, append([]string(nil), fields[2:]...))
+	}
+	return rules
+}
+
+func firstRulesMatch(rules [][]string, desired [][]string) bool {
+	if len(rules) < len(desired) {
+		return false
+	}
+	for i, rule := range desired {
+		if !ruleEquals(rules[i], rule) {
+			return false
+		}
+	}
+	return true
+}
+
+func isManagedJump(rule []string, chain string) bool {
+	if len(rule) == 2 && rule[0] == "-j" && rule[1] == chain {
+		return true
+	}
+	if len(rule) == 4 && rule[0] == "-i" && rule[2] == "-j" && rule[3] == chain {
+		return true
+	}
+	return false
+}
+
+func containsRule(rules [][]string, want []string) bool {
+	for _, rule := range rules {
+		if ruleEquals(rule, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func ruleEquals(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func toSet(values []string) map[string]struct{} {

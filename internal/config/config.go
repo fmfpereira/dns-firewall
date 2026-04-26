@@ -22,10 +22,12 @@ type Config struct {
 }
 
 type FirewallConfig struct {
-	Chain string `json:"chain"`
+	Chain      string   `json:"chain"`
+	Interfaces []string `json:"interfaces"`
 }
 
 var chainNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,28}$`)
+var interfaceNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,15}$`)
 
 func Load(path string) (Config, error) {
 	data, err := os.ReadFile(path)
@@ -72,6 +74,14 @@ func (c Config) Validate() error {
 	}
 	if !chainNamePattern.MatchString(c.Firewall.Chain) {
 		return fmt.Errorf("firewall.chain must be 1-28 characters using only letters, digits, underscore, or hyphen")
+	}
+	for i, iface := range c.Firewall.Interfaces {
+		if iface == "" {
+			return fmt.Errorf("firewall.interfaces[%d] must not be empty", i)
+		}
+		if !interfaceNamePattern.MatchString(iface) {
+			return fmt.Errorf("firewall.interfaces[%d] must be 1-15 characters using only letters, digits, underscore, dot, colon, or hyphen", i)
+		}
 	}
 	return nil
 }

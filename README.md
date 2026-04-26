@@ -7,6 +7,7 @@ Runtime requirements:
 - `iptables` for IPv4 rules
 - `ip6tables` for IPv6 rules
 - `iptables-restore` and `ip6tables-restore` for transactional rule updates
+- `ip` from `iproute2` for default-route interface detection
 - `systemd` for running as a Linux service
 
 ## TXT Record Format
@@ -53,7 +54,24 @@ Edit `/etc/dns-firewall/config.json`:
 
 `nameservers` is optional. If it is omitted or empty, the service uses the default resolver configured on the operating system. Values can be plain IPs, such as `1.1.1.1`, IPv6 literals, such as `2001:4860:4860::8888`, or `host:port`, such as `1.1.1.1:53`.
 
-The only configurable firewall setting is the managed chain name. The service always attaches that chain to `INPUT` at position `1`, manages both IPv4 and IPv6, and keeps existing allowlist rules if DNS lookup fails or resolves to no addresses.
+The configurable firewall setting is the managed chain name. By default, the service scopes the gate to the interface from the system default route for each IP family, equivalent to the interface used for `0.0.0.0/0` and `::/0`.
+
+For complex hosts, `firewall.interfaces` can be set explicitly:
+
+```json
+"firewall": {
+  "chain": "DNS_FIREWALL_ALLOW",
+  "interfaces": ["eth0", "ppp0"]
+}
+```
+
+Use explicit interfaces for multi-WAN, VPN default routes, policy routing, or failover setups. Do not list LAN, loopback, Docker, or other internal interfaces unless you also want those interfaces gated by the DNS allowlist. See `config/dns-firewall.multi-wan.json.example` for a full sample.
+
+The service attaches the managed chain to `INPUT` at position `1` for each detected or configured interface, manages both IPv4 and IPv6, and keeps existing rules if DNS lookup fails or resolves to no addresses.
+
+If no default route exists for an IP family, the service removes its managed `INPUT` jumps for that family so stale public-interface gates are not left behind.
+
+The gate is enforced per family. If your TXT records resolve to IPv4 addresses only, all inbound IPv6 on the gated interface is dropped (and vice versa). On dual-stack hosts, either include both families in the allowlist or accept that the unlisted family will be blocked on the public interface.
 
 ## Install From A Release
 
@@ -138,11 +156,14 @@ sudo journalctl -u dns-firewall.service -f
 The service creates a dedicated chain and inserts a jump to it from `INPUT`:
 
 ```text
-INPUT -> DNS_FIREWALL_ALLOW
-DNS_FIREWALL_ALLOW -s <resolved-ip> -j ACCEPT
+INPUT -i <internet-interface> -> DNS_FIREWALL_ALLOW
+DNS_FIREWALL_ALLOW -s <resolved-ip> -j RETURN
+DNS_FIREWALL_ALLOW -j DROP
 ```
 
-It updates only `DNS_FIREWALL_ALLOW`, using `iptables-restore --noflush` / `ip6tables-restore --noflush` so the managed chain rewrite is applied as one transaction.
+The DNS allowlist is a first gate, not the final allow decision. A matching source returns to `INPUT` so later firewall rules are still evaluated. A non-matching source on a configured internet-facing interface is dropped before later rules run.
+
+It updates only `DNS_FIREWALL_ALLOW`, using `iptables-restore --noflush` / `ip6tables-restore --noflush` so the managed chain rewrite is applied as one transaction. The service also keeps its `INPUT` jump rules first and removes stale jumps to the managed chain when the detected or configured interface list changes.
 
 ## Logging
 
