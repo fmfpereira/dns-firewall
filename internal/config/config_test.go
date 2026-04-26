@@ -77,6 +77,22 @@ func TestLoadRejectsInvalidChainName(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsTrailingJSON(t *testing.T) {
+	path := writeConfig(t, `{
+  "poll_interval": "1m",
+  "records": ["_allow.example.com"],
+  "firewall": {
+    "chain": "DNS_FW"
+  }
+}
+{"unexpected": true}`)
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "trailing content") {
+		t.Fatalf("got error %v, want trailing-content rejection", err)
+	}
+}
+
 func TestLoadAllowsMissingInterfaces(t *testing.T) {
 	path := writeConfig(t, `{
   "poll_interval": "1m",
@@ -92,6 +108,92 @@ func TestLoadAllowsMissingInterfaces(t *testing.T) {
 	}
 	if len(cfg.Firewall.Interfaces) != 0 {
 		t.Fatalf("got interfaces %v, want none", cfg.Firewall.Interfaces)
+	}
+}
+
+func TestLoadExtraAttachChains(t *testing.T) {
+	path := writeConfig(t, `{
+  "poll_interval": "1m",
+  "records": ["_allow.example.com"],
+  "firewall": {
+    "chain": "DNS_FW",
+    "interfaces": ["eth0"],
+    "extra_attach_chains": ["DOCKER-USER", "CNI-FORWARD"]
+  }
+}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Firewall.ExtraAttachChains) != 2 ||
+		cfg.Firewall.ExtraAttachChains[0] != "DOCKER-USER" ||
+		cfg.Firewall.ExtraAttachChains[1] != "CNI-FORWARD" {
+		t.Fatalf("got %v", cfg.Firewall.ExtraAttachChains)
+	}
+}
+
+func TestLoadRejectsInputAsExtraAttachChain(t *testing.T) {
+	path := writeConfig(t, `{
+  "poll_interval": "1m",
+  "records": ["_allow.example.com"],
+  "firewall": {
+    "chain": "DNS_FW",
+    "extra_attach_chains": ["INPUT"]
+  }
+}`)
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "INPUT") {
+		t.Fatalf("got error %v, want rejection of INPUT in extra_attach_chains", err)
+	}
+}
+
+func TestLoadRejectsManagedChainAsExtraAttachChain(t *testing.T) {
+	path := writeConfig(t, `{
+  "poll_interval": "1m",
+  "records": ["_allow.example.com"],
+  "firewall": {
+    "chain": "DNS_FW",
+    "extra_attach_chains": ["DNS_FW"]
+  }
+}`)
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "firewall.chain") {
+		t.Fatalf("got error %v, want rejection of managed chain in extra_attach_chains", err)
+	}
+}
+
+func TestLoadRejectsDuplicateExtraAttachChains(t *testing.T) {
+	path := writeConfig(t, `{
+  "poll_interval": "1m",
+  "records": ["_allow.example.com"],
+  "firewall": {
+    "chain": "DNS_FW",
+    "extra_attach_chains": ["DOCKER-USER", "DOCKER-USER"]
+  }
+}`)
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("got error %v, want duplicate-entry rejection", err)
+	}
+}
+
+func TestLoadRejectsInvalidExtraAttachChainName(t *testing.T) {
+	path := writeConfig(t, `{
+  "poll_interval": "1m",
+  "records": ["_allow.example.com"],
+  "firewall": {
+    "chain": "DNS_FW",
+    "extra_attach_chains": ["BAD CHAIN"]
+  }
+}`)
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "extra_attach_chains") {
+		t.Fatalf("got error %v, want extra_attach_chains validation error", err)
 	}
 }
 

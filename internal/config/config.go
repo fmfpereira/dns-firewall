@@ -3,7 +3,9 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"time"
@@ -22,8 +24,9 @@ type Config struct {
 }
 
 type FirewallConfig struct {
-	Chain      string   `json:"chain"`
-	Interfaces []string `json:"interfaces"`
+	Chain             string   `json:"chain"`
+	Interfaces        []string `json:"interfaces"`
+	ExtraAttachChains []string `json:"extra_attach_chains,omitempty"`
 }
 
 var chainNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,28}$`)
@@ -45,6 +48,13 @@ func Load(path string) (Config, error) {
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&cfg); err != nil {
 		return Config{}, err
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return Config{}, fmt.Errorf("unexpected trailing content after configuration object: %w", err)
+		}
+		return Config{}, fmt.Errorf("unexpected trailing content after configuration object")
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -82,6 +92,25 @@ func (c Config) Validate() error {
 		if !interfaceNamePattern.MatchString(iface) {
 			return fmt.Errorf("firewall.interfaces[%d] must be 1-15 characters using only letters, digits, underscore, dot, colon, or hyphen", i)
 		}
+	}
+	seenChains := map[string]struct{}{}
+	for i, chain := range c.Firewall.ExtraAttachChains {
+		if chain == "" {
+			return fmt.Errorf("firewall.extra_attach_chains[%d] must not be empty", i)
+		}
+		if !chainNamePattern.MatchString(chain) {
+			return fmt.Errorf("firewall.extra_attach_chains[%d] must be 1-28 characters using only letters, digits, underscore, or hyphen", i)
+		}
+		if chain == "INPUT" {
+			return fmt.Errorf("firewall.extra_attach_chains[%d] must not be INPUT (already managed)", i)
+		}
+		if chain == c.Firewall.Chain {
+			return fmt.Errorf("firewall.extra_attach_chains[%d] must not equal firewall.chain", i)
+		}
+		if _, dup := seenChains[chain]; dup {
+			return fmt.Errorf("firewall.extra_attach_chains[%d] is a duplicate of an earlier entry: %q", i, chain)
+		}
+		seenChains[chain] = struct{}{}
 	}
 	return nil
 }

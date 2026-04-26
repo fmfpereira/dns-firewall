@@ -53,7 +53,7 @@ func run(ctx context.Context, configPath string, once bool, dryRunFlag bool) err
 			return err
 		}
 
-		if err := syncOnce(ctx, cfg, dryRunFlag || cfg.DryRun); err != nil {
+		if err := syncOnce(ctx, cfg, dryRunFlag || cfg.DryRun, once); err != nil {
 			return err
 		}
 		if once {
@@ -70,15 +70,24 @@ func run(ctx context.Context, configPath string, once bool, dryRunFlag bool) err
 	}
 }
 
-func syncOnce(ctx context.Context, cfg config.Config, dryRun bool) error {
+func syncOnce(ctx context.Context, cfg config.Config, dryRun bool, once bool) error {
 	allowlist, err := dns.CollectAllowedAddresses(ctx, cfg.Records, cfg.Nameservers)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
 		slog.Error("DNS collection failed; keeping existing firewall rules", "error", err)
+		if once {
+			return fmt.Errorf("DNS collection failed: %w", err)
+		}
 		return nil
 	}
 
 	if len(allowlist) == 0 {
 		slog.Warn("no addresses resolved; keeping existing firewall rules")
+		if once {
+			return errors.New("no addresses resolved; firewall not updated")
+		}
 		return nil
 	}
 

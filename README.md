@@ -69,6 +69,17 @@ Use explicit interfaces for multi-WAN, VPN default routes, policy routing, or fa
 
 The service attaches the managed chain to `INPUT` at position `1` for each detected or configured interface, manages both IPv4 and IPv6, and keeps existing rules if DNS lookup fails or resolves to no addresses.
 
+`INPUT` only sees packets destined for the host itself. Container traffic is DNATed in `PREROUTING` and routed through `FORWARD`, so a managed `INPUT` jump does not gate published container ports. Set `firewall.extra_attach_chains` to also attach the managed chain to runtime-specific hook chains:
+
+```json
+"firewall": {
+  "chain": "DNS_FIREWALL_ALLOW",
+  "extra_attach_chains": ["DOCKER-USER"]
+}
+```
+
+Docker preserves `DOCKER-USER` across daemon restarts and never touches it itself, making it the canonical place to gate Docker-published ports. See `config/dns-firewall.docker.json.example` for a full sample. For Podman use `CNI-FORWARD` (CNI backend) or `NETAVARK-FORWARD` (Netavark backend). The same RETURN/INVALID-DROP/source-RETURN/DROP layout is applied — RETURN from the extra chain re-enters the parent chain (so allowed sources continue through the runtime's normal forwarding logic). Each extra chain must already exist; if it does not, the manager logs a warning and skips it. Removing a chain from the config does not remove a previously inserted jump — clean it up manually with `iptables -D <chain> -i <iface> -j <managed-chain>`.
+
 If no default route exists for an IP family, the service removes its managed `INPUT` jumps for that family so stale public-interface gates are not left behind.
 
 The gate is enforced per family for new inbound connections. If your TXT records resolve to IPv4 addresses only, new inbound IPv6 connections on the gated interface are dropped (and vice versa); reply traffic for outbound IPv6 connections still flows via the conntrack rule. On dual-stack hosts, either include both families in the allowlist or accept that new inbound on the unlisted family will be blocked on the public interface.

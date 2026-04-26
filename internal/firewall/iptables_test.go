@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -112,6 +113,13 @@ func TestRestoreInputRoundTripIsCanonical(t *testing.T) {
 	}
 	if !reflect.DeepEqual(state.sources, sources) {
 		t.Fatalf("round-trip sources got %v, want %v", state.sources, sources)
+	}
+	want := 2 + len(sources) + 1
+	if state.totalRules != want {
+		t.Fatalf("rendered chain has %d rules, expected exactly %d (2 sentinels + %d sources + terminal DROP)", state.totalRules, want, len(sources))
+	}
+	if !state.canonicalShape {
+		t.Fatal("rendered chain must round-trip as canonicalShape=true; otherwise every apply re-renders")
 	}
 }
 
@@ -274,10 +282,22 @@ func (f *fakeIptables) commandFn(_ context.Context, binary string, args ...strin
 
 	switch args[i] {
 	case "-S":
-		if i+1 < len(args) && args[i+1] != "INPUT" {
-			return f.dumpChain(args[i+1]), nil
+		if i+1 >= len(args) {
+			return f.dump(), nil
 		}
-		return f.dump(), nil
+		chain := args[i+1]
+		if chain == "INPUT" {
+			return f.dump(), nil
+		}
+		if _, ok := f.chainRules[chain]; !ok {
+			return "", commandError{
+				binary: binary,
+				args:   append([]string(nil), args...),
+				output: "iptables: No chain/target/match by that name.",
+				err:    errors.New("exit status 1"),
+			}
+		}
+		return f.dumpChain(chain), nil
 	case "-N":
 		return "", nil
 	case "-F":
@@ -289,29 +309,33 @@ func (f *fakeIptables) commandFn(_ context.Context, binary string, args ...strin
 		if i+3 > len(args) {
 			return "", nil
 		}
+		chain := args[i+1]
 		pos, _ := strconv.Atoi(args[i+2])
 		spec := append([]string(nil), args[i+3:]...)
+		rules := f.rulesFor(chain)
 		idx := pos - 1
 		if idx < 0 {
 			idx = 0
 		}
-		if idx > len(f.rules) {
-			idx = len(f.rules)
+		if idx > len(rules) {
+			idx = len(rules)
 		}
-		updated := make([][]string, 0, len(f.rules)+1)
-		updated = append(updated, f.rules[:idx]...)
+		updated := make([][]string, 0, len(rules)+1)
+		updated = append(updated, rules[:idx]...)
 		updated = append(updated, spec)
-		updated = append(updated, f.rules[idx:]...)
-		f.rules = updated
+		updated = append(updated, rules[idx:]...)
+		f.setRulesFor(chain, updated)
 		return "", nil
 	case "-D":
 		if i+2 > len(args) {
 			return "", nil
 		}
+		chain := args[i+1]
 		spec := args[i+2:]
-		for j, rule := range f.rules {
+		rules := f.rulesFor(chain)
+		for j, rule := range rules {
 			if reflect.DeepEqual(rule, spec) {
-				f.rules = append(f.rules[:j], f.rules[j+1:]...)
+				f.setRulesFor(chain, append(rules[:j], rules[j+1:]...))
 				return "", nil
 			}
 		}
@@ -323,6 +347,24 @@ func (f *fakeIptables) commandFn(_ context.Context, binary string, args ...strin
 		}
 	}
 	return "", nil
+}
+
+func (f *fakeIptables) rulesFor(chain string) [][]string {
+	if chain == "INPUT" {
+		return f.rules
+	}
+	return f.chainRules[chain]
+}
+
+func (f *fakeIptables) setRulesFor(chain string, rules [][]string) {
+	if chain == "INPUT" {
+		f.rules = rules
+		return
+	}
+	if f.chainRules == nil {
+		f.chainRules = map[string][][]string{}
+	}
+	f.chainRules[chain] = rules
 }
 
 func (f *fakeIptables) dump() string {
@@ -454,6 +496,121 @@ func TestEnsureJumpsInsertsBeforeRemovingStale(t *testing.T) {
 	}
 }
 
+func TestApplyRewritesSourceRuleWithExtraMatchClauses(t *testing.T) {
+	narrowed := [][]string{
+		{"-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "RETURN"},
+		{"-m", "conntrack", "--ctstate", "INVALID", "-j", "DROP"},
+		{"-s", "192.0.2.10", "-p", "tcp", "-j", "RETURN"},
+		{"-j", "DROP"},
+	}
+	fake := &fakeIptables{
+		rules: [][]string{{"-i", "eth0", "-j", "DNS_FW"}},
+		chainRules: map[string][][]string{
+			"DNS_FW": narrowed,
+		},
+	}
+	mgr := &Manager{
+		config:    config.FirewallConfig{Chain: "DNS_FW", Interfaces: []string{"eth0"}},
+		commandFn: fake.commandFn,
+		restoreFn: fake.restoreFn,
+	}
+
+	err := mgr.Apply(context.Background(), []dns.AllowedAddress{
+		{Family: dns.IPv4, Value: "192.0.2.10"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(fake.restorePayloads) == 0 {
+		t.Fatal("expected restore to fire when source rule has extra match clauses, even though source set matches desired")
+	}
+	for _, payload := range fake.restorePayloads {
+		if strings.Contains(payload, "-p tcp") {
+			t.Fatalf("rewritten payload must not preserve narrowed match clauses:\n%s", payload)
+		}
+	}
+}
+
+func TestChainHasCanonicalShapeRejectsExtraClauses(t *testing.T) {
+	cases := map[string][][]string{
+		"extra clause on source rule": {
+			{"-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "RETURN"},
+			{"-m", "conntrack", "--ctstate", "INVALID", "-j", "DROP"},
+			{"-s", "192.0.2.10", "-p", "tcp", "-j", "RETURN"},
+			{"-j", "DROP"},
+		},
+		"extra clause on terminal drop": {
+			{"-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "RETURN"},
+			{"-m", "conntrack", "--ctstate", "INVALID", "-j", "DROP"},
+			{"-s", "192.0.2.10", "-j", "RETURN"},
+			{"-p", "tcp", "-j", "DROP"},
+		},
+		"sources out of sorted order": {
+			{"-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "RETURN"},
+			{"-m", "conntrack", "--ctstate", "INVALID", "-j", "DROP"},
+			{"-s", "198.51.100.1", "-j", "RETURN"},
+			{"-s", "192.0.2.10", "-j", "RETURN"},
+			{"-j", "DROP"},
+		},
+	}
+	for name, rules := range cases {
+		sources := []string{}
+		seen := map[string]struct{}{}
+		for _, fields := range rules {
+			for i := 0; i < len(fields)-1; i++ {
+				if fields[i] == "-s" && ruleJumpsTo(fields, "RETURN") {
+					seen[fields[i+1]] = struct{}{}
+				}
+			}
+		}
+		for s := range seen {
+			sources = append(sources, s)
+		}
+		sort.Strings(sources)
+		if chainHasCanonicalShape(rules, sources) {
+			t.Fatalf("%s: expected canonicalShape=false but got true", name)
+		}
+	}
+}
+
+func TestApplyRewritesChainWithStrayRule(t *testing.T) {
+	withStray := [][]string{
+		{"-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "RETURN"},
+		{"-m", "conntrack", "--ctstate", "INVALID", "-j", "DROP"},
+		{"-s", "192.0.2.10", "-j", "RETURN"},
+		{"-j", "ACCEPT"},
+		{"-j", "DROP"},
+	}
+	fake := &fakeIptables{
+		rules: [][]string{{"-i", "eth0", "-j", "DNS_FW"}},
+		chainRules: map[string][][]string{
+			"DNS_FW": withStray,
+		},
+	}
+	mgr := &Manager{
+		config:    config.FirewallConfig{Chain: "DNS_FW", Interfaces: []string{"eth0"}},
+		commandFn: fake.commandFn,
+		restoreFn: fake.restoreFn,
+	}
+
+	err := mgr.Apply(context.Background(), []dns.AllowedAddress{
+		{Family: dns.IPv4, Value: "192.0.2.10"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(fake.restorePayloads) == 0 {
+		t.Fatal("expected restore to fire when stray rule present even though sources match")
+	}
+	for _, payload := range fake.restorePayloads {
+		if strings.Contains(payload, "-j ACCEPT") {
+			t.Fatalf("rewritten payload must not preserve stray ACCEPT rule:\n%s", payload)
+		}
+	}
+}
+
 func TestApplyMigratesLegacyChainLayout(t *testing.T) {
 	legacy := [][]string{
 		{"-s", "192.0.2.10", "-j", "RETURN"},
@@ -487,6 +644,129 @@ func TestApplyMigratesLegacyChainLayout(t *testing.T) {
 		}
 		if !strings.Contains(payload, "-A DNS_FW -m conntrack --ctstate INVALID -j DROP") {
 			t.Fatalf("restore payload missing INVALID DROP:\n%s", payload)
+		}
+	}
+}
+
+func TestEnsureJumpsAttachesToExtraChainWhenPresent(t *testing.T) {
+	fake := &fakeIptables{
+		chainRules: map[string][][]string{
+			"DOCKER-USER": nil,
+		},
+	}
+	mgr := &Manager{
+		config: config.FirewallConfig{
+			Chain:             "DNS_FW",
+			ExtraAttachChains: []string{"DOCKER-USER"},
+		},
+		commandFn: fake.commandFn,
+		restoreFn: fake.restoreFn,
+	}
+
+	if err := mgr.ensureJumps(context.Background(), "iptables", []string{"eth0"}); err != nil {
+		t.Fatal(err)
+	}
+
+	wantInput := [][]string{{"-i", "eth0", "-j", "DNS_FW"}}
+	if !reflect.DeepEqual(fake.rules, wantInput) {
+		t.Fatalf("INPUT rules got %v, want %v", fake.rules, wantInput)
+	}
+	wantDocker := [][]string{{"-i", "eth0", "-j", "DNS_FW"}}
+	if !reflect.DeepEqual(fake.chainRules["DOCKER-USER"], wantDocker) {
+		t.Fatalf("DOCKER-USER rules got %v, want %v", fake.chainRules["DOCKER-USER"], wantDocker)
+	}
+}
+
+func TestEnsureJumpsSkipsMissingExtraChain(t *testing.T) {
+	fake := &fakeIptables{}
+	mgr := &Manager{
+		config: config.FirewallConfig{
+			Chain:             "DNS_FW",
+			ExtraAttachChains: []string{"DOCKER-USER"},
+		},
+		commandFn: fake.commandFn,
+		restoreFn: fake.restoreFn,
+	}
+
+	if err := mgr.ensureJumps(context.Background(), "iptables", []string{"eth0"}); err != nil {
+		t.Fatalf("missing extra chain must not fail apply: %v", err)
+	}
+
+	wantInput := [][]string{{"-i", "eth0", "-j", "DNS_FW"}}
+	if !reflect.DeepEqual(fake.rules, wantInput) {
+		t.Fatalf("INPUT rules got %v, want %v", fake.rules, wantInput)
+	}
+	if _, ok := fake.chainRules["DOCKER-USER"]; ok {
+		t.Fatal("missing chain must not be created by the manager")
+	}
+}
+
+func TestEnsureJumpsTracksMissingChainStateAcrossCalls(t *testing.T) {
+	missingChainStateMu.Lock()
+	missingChainState = map[string]bool{}
+	missingChainStateMu.Unlock()
+
+	fake := &fakeIptables{}
+	mgr := &Manager{
+		config: config.FirewallConfig{
+			Chain:             "DNS_FW",
+			ExtraAttachChains: []string{"DOCKER-USER"},
+		},
+		commandFn: fake.commandFn,
+		restoreFn: fake.restoreFn,
+	}
+
+	if err := mgr.ensureJumps(context.Background(), "iptables", []string{"eth0"}); err != nil {
+		t.Fatalf("first apply with missing chain must succeed: %v", err)
+	}
+	missingChainStateMu.Lock()
+	marked := missingChainState["iptables/DOCKER-USER"]
+	missingChainStateMu.Unlock()
+	if !marked {
+		t.Fatal("missing chain must be tracked after first encounter so warns are rate-limited")
+	}
+
+	if err := mgr.ensureJumps(context.Background(), "iptables", []string{"eth0"}); err != nil {
+		t.Fatalf("second apply with missing chain must succeed: %v", err)
+	}
+
+	fake.chainRules = map[string][][]string{"DOCKER-USER": nil}
+	if err := mgr.ensureJumps(context.Background(), "iptables", []string{"eth0"}); err != nil {
+		t.Fatal(err)
+	}
+	missingChainStateMu.Lock()
+	stillMarked := missingChainState["iptables/DOCKER-USER"]
+	missingChainStateMu.Unlock()
+	if stillMarked {
+		t.Fatal("missing chain state must clear once the chain appears, so a future absence warns again")
+	}
+}
+
+func TestEnsureJumpsExtraChainAlreadyInSyncNoop(t *testing.T) {
+	fake := &fakeIptables{
+		rules: [][]string{{"-i", "eth0", "-j", "DNS_FW"}},
+		chainRules: map[string][][]string{
+			"DOCKER-USER": {{"-i", "eth0", "-j", "DNS_FW"}},
+		},
+	}
+	mgr := &Manager{
+		config: config.FirewallConfig{
+			Chain:             "DNS_FW",
+			ExtraAttachChains: []string{"DOCKER-USER"},
+		},
+		commandFn: fake.commandFn,
+		restoreFn: fake.restoreFn,
+	}
+
+	if err := mgr.ensureJumps(context.Background(), "iptables", []string{"eth0"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, call := range fake.calls {
+		for _, arg := range call {
+			if arg == "-I" || arg == "-D" {
+				t.Fatalf("expected only reads when both chains in sync, got %v", call)
+			}
 		}
 	}
 }
