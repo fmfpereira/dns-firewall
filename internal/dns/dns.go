@@ -66,24 +66,18 @@ func CollectAllowedAddresses(ctx context.Context, records []string, nameservers 
 		slog.Info("TXT record resolved", "record", record, "values", len(txtValues))
 		for _, txtValue := range txtValues {
 			for _, value := range SplitTXTValue(txtValue) {
-				for _, address := range ResolveTXTValue(ctx, resolvers, value, record) {
-					seen[string(address.Family)+"|"+address.Value] = address
+				addresses, err := ResolveTXTValue(ctx, resolvers, value, record)
+				if err != nil {
+					return nil, fmt.Errorf("resolve TXT value %q from %s: %w", value, record, err)
+				}
+				for _, address := range addresses {
+					seen[addressKey(address)] = address
 				}
 			}
 		}
 	}
 
-	allowlist := make([]AllowedAddress, 0, len(seen))
-	for _, address := range seen {
-		allowlist = append(allowlist, address)
-	}
-	sort.Slice(allowlist, func(i, j int) bool {
-		if allowlist[i].Family != allowlist[j].Family {
-			return allowlist[i].Family < allowlist[j].Family
-		}
-		return allowlist[i].Value < allowlist[j].Value
-	})
-	return allowlist, nil
+	return sortedAllowedAddresses(seen), nil
 }
 
 func (g *ResolverGroup) LookupTXT(ctx context.Context, name string) ([]string, error) {
@@ -125,21 +119,20 @@ func SplitTXTValue(value string) []string {
 	return values
 }
 
-func ResolveTXTValue(ctx context.Context, resolvers *ResolverGroup, value string, sourceRecord string) []AllowedAddress {
+func ResolveTXTValue(ctx context.Context, resolvers *ResolverGroup, value string, sourceRecord string) ([]AllowedAddress, error) {
 	if address, ok := parseAddress(value); ok {
-		return []AllowedAddress{address}
+		return []AllowedAddress{address}, nil
 	}
 
 	hostname := strings.TrimSuffix(value, ".")
 	if !isHostname(hostname) {
 		slog.Warn("ignoring invalid TXT value", "record", sourceRecord, "value", value)
-		return nil
+		return nil, nil
 	}
 
 	ipAddrs, err := resolvers.LookupIPAddr(ctx, hostname)
 	if err != nil {
-		slog.Warn("could not resolve hostname from TXT value", "record", sourceRecord, "hostname", hostname, "error", err)
-		return nil
+		return nil, fmt.Errorf("lookup host %s: %w", hostname, err)
 	}
 
 	seen := map[string]AllowedAddress{}
@@ -154,13 +147,22 @@ func ResolveTXTValue(ctx context.Context, resolvers *ResolverGroup, value string
 		if addr.Is4() {
 			family = IPv4
 		}
-		seen[string(family)+"|"+addr.String()] = AllowedAddress{
+		address := AllowedAddress{
 			Family: family,
 			Source: value,
 			Value:  addr.String(),
 		}
+		seen[addressKey(address)] = address
 	}
 
+	return sortedAllowedAddresses(seen), nil
+}
+
+func addressKey(address AllowedAddress) string {
+	return string(address.Family) + "|" + address.Value
+}
+
+func sortedAllowedAddresses(seen map[string]AllowedAddress) []AllowedAddress {
 	addresses := make([]AllowedAddress, 0, len(seen))
 	for _, address := range seen {
 		addresses = append(addresses, address)

@@ -50,53 +50,78 @@ func (m *Manager) Apply(ctx context.Context, addresses []dns.AllowedAddress) err
 		slog.Warn("refusing to apply empty allowlist; keeping existing firewall rules")
 		return nil
 	}
-	if err := m.applyFamily(ctx, "iptables", dns.IPv4, addresses); err != nil {
-		return err
+	targets := []familyTarget{
+		{binary: "iptables", family: dns.IPv4},
+		{binary: "ip6tables", family: dns.IPv6},
 	}
-	if err := m.applyFamily(ctx, "ip6tables", dns.IPv6, addresses); err != nil {
-		return err
+
+	for i := range targets {
+		interfaces, err := m.effectiveInterfaces(ctx, targets[i].family)
+		if err != nil {
+			return err
+		}
+		targets[i].interfaces = interfaces
+	}
+	for _, target := range targets {
+		if len(target.interfaces) == 0 {
+			continue
+		}
+		if err := m.requireExtraAttachChains(ctx, target.binary); err != nil {
+			return err
+		}
+	}
+
+	for _, target := range targets {
+		if err := m.applyFamily(ctx, target, addresses); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func (m *Manager) applyFamily(ctx context.Context, binary string, family dns.Family, addresses []dns.AllowedAddress) error {
-	interfaces, err := m.effectiveInterfaces(ctx, family)
-	if err != nil {
-		return err
-	}
-	if len(interfaces) == 0 {
-		markNoDefaultRoute(binary, family)
-		return m.removeManagedJumps(ctx, binary)
-	}
-	clearNoDefaultRoute(binary, family)
+type familyTarget struct {
+	binary     string
+	family     dns.Family
+	interfaces []string
+}
 
-	if err := m.ensureChain(ctx, binary); err != nil {
+func (m *Manager) applyFamily(ctx context.Context, target familyTarget, addresses []dns.AllowedAddress) error {
+	if len(target.interfaces) == 0 {
+		markNoDefaultRoute(target.binary, target.family)
+		return m.removeManagedJumps(ctx, target.binary)
+	}
+	clearNoDefaultRoute(target.binary, target.family)
+
+	if err := m.ensureChain(ctx, target.binary); err != nil {
 		return err
 	}
-	if err := m.ensureJumps(ctx, binary, interfaces); err != nil {
+	if err := m.requireExtraAttachChains(ctx, target.binary); err != nil {
 		return err
 	}
 
-	desired := desiredSources(family, addresses)
+	desired := desiredSources(target.family, addresses)
 	if m.dryRun {
-		slog.Info("dry-run firewall update planned", "binary", binary, "chain", m.config.Chain, "desired_rules", len(desired))
-		return m.restoreRules(ctx, binary, desired)
+		slog.Info("dry-run firewall update planned", "binary", target.binary, "chain", m.config.Chain, "desired_rules", len(desired))
+		if err := m.restoreRules(ctx, target.binary, desired); err != nil {
+			return err
+		}
+		return m.ensureJumps(ctx, target.binary, target.interfaces)
 	}
 
-	state, err := m.currentState(ctx, binary)
+	state, err := m.currentState(ctx, target.binary)
 	if err != nil {
 		return err
 	}
 	added, removed := sourceDiff(state.sources, desired)
 	expectedRules := 2 + len(desired) + 1
 	if len(added) == 0 && len(removed) == 0 && state.canonicalShape {
-		slog.Info("firewall already in sync", "binary", binary, "chain", m.config.Chain, "rules", len(desired))
-		return nil
+		slog.Info("firewall already in sync", "binary", target.binary, "chain", m.config.Chain, "rules", len(desired))
+		return m.ensureJumps(ctx, target.binary, target.interfaces)
 	}
 	if !state.canonicalShape {
 		slog.Info(
 			"rewriting managed chain to canonical layout",
-			"binary", binary,
+			"binary", target.binary,
 			"chain", m.config.Chain,
 			"conntrack_return", state.conntrackReturn,
 			"invalid_drop", state.invalidDrop,
@@ -107,7 +132,7 @@ func (m *Manager) applyFamily(ctx context.Context, binary string, family dns.Fam
 	}
 	slog.Info(
 		"firewall change detected",
-		"binary", binary,
+		"binary", target.binary,
 		"chain", m.config.Chain,
 		"desired_rules", len(desired),
 		"current_rules", len(state.sources),
@@ -119,21 +144,21 @@ func (m *Manager) applyFamily(ctx context.Context, binary string, family dns.Fam
 		"added", len(added),
 		"removed", len(removed),
 	)
-	slog.Debug("firewall rule diff", "binary", binary, "added", added, "removed", removed)
+	slog.Debug("firewall rule diff", "binary", target.binary, "added", added, "removed", removed)
 
-	if err := m.restoreRules(ctx, binary, desired); err != nil {
+	if err := m.restoreRules(ctx, target.binary, desired); err != nil {
 		return err
 	}
-	slog.Info("firewall rules updated", "binary", binary, "chain", m.config.Chain, "rules", len(desired))
+	slog.Info("firewall rules updated", "binary", target.binary, "chain", m.config.Chain, "rules", len(desired))
+	if err := m.ensureJumps(ctx, target.binary, target.interfaces); err != nil {
+		return err
+	}
 	return nil
 }
 
 var (
 	noRouteStateMu sync.Mutex
 	noRouteState   = map[string]bool{}
-
-	missingChainStateMu sync.Mutex
-	missingChainState   = map[string]bool{}
 )
 
 func markNoDefaultRoute(binary string, family dns.Family) {
@@ -155,29 +180,6 @@ func clearNoDefaultRoute(binary string, family dns.Family) {
 	}
 	delete(noRouteState, binary)
 	slog.Info("default-route interface restored", "binary", binary, "family", family)
-}
-
-func markChainMissing(binary, chain string) {
-	key := binary + "/" + chain
-	missingChainStateMu.Lock()
-	defer missingChainStateMu.Unlock()
-	if missingChainState[key] {
-		slog.Debug("extra attach chain still missing", "binary", binary, "attach_chain", chain)
-		return
-	}
-	missingChainState[key] = true
-	slog.Warn("extra attach chain not found; skipping", "binary", binary, "attach_chain", chain)
-}
-
-func clearChainMissing(binary, chain string) {
-	key := binary + "/" + chain
-	missingChainStateMu.Lock()
-	defer missingChainStateMu.Unlock()
-	if !missingChainState[key] {
-		return
-	}
-	delete(missingChainState, key)
-	slog.Info("extra attach chain found", "binary", binary, "attach_chain", chain)
 }
 
 func (m *Manager) effectiveInterfaces(ctx context.Context, family dns.Family) ([]string, error) {
@@ -206,8 +208,23 @@ func (m *Manager) ensureChain(ctx context.Context, binary string) error {
 }
 
 func (m *Manager) ensureJumps(ctx context.Context, binary string, interfaces []string) error {
+	if err := m.requireExtraAttachChains(ctx, binary); err != nil {
+		return err
+	}
 	for _, chain := range m.attachChains() {
 		if err := m.ensureJumpsForChain(ctx, binary, chain, interfaces); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) requireExtraAttachChains(ctx context.Context, binary string) error {
+	for _, chain := range m.config.ExtraAttachChains {
+		if _, err := m.attachChainRules(ctx, binary, chain); err != nil {
+			if isMissingChain(err) {
+				return fmt.Errorf("configured attach chain %s does not exist for %s: %w", chain, binary, err)
+			}
 			return err
 		}
 	}
@@ -219,17 +236,13 @@ func (m *Manager) ensureJumpsForChain(ctx context.Context, binary, chain string,
 	rules, err := m.attachChainRules(ctx, binary, chain)
 	if err != nil {
 		if chain != inputChain && isMissingChain(err) {
-			markChainMissing(binary, chain)
-			return nil
+			return fmt.Errorf("configured attach chain %s does not exist for %s: %w", chain, binary, err)
 		}
 		return err
 	}
-	if chain != inputChain {
-		clearChainMissing(binary, chain)
-	}
 
 	if firstRulesMatch(rules, desired) {
-		return m.removeStaleJumps(ctx, binary, chain, rules[len(desired):], nil)
+		return m.removeStaleJumps(ctx, binary, chain, rules[len(desired):], desired)
 	}
 
 	for i, spec := range desired {
@@ -247,7 +260,7 @@ func (m *Manager) ensureJumpsForChain(ctx context.Context, binary, chain string,
 	if len(postInsertRules) <= len(desired) {
 		return nil
 	}
-	return m.removeStaleJumps(ctx, binary, chain, postInsertRules[len(desired):], nil)
+	return m.removeStaleJumps(ctx, binary, chain, postInsertRules[len(desired):], desired)
 }
 
 func (m *Manager) run(ctx context.Context, binary string, args ...string) error {
@@ -278,6 +291,8 @@ func (m *Manager) attachChainRules(ctx context.Context, binary, chain string) ([
 
 func (m *Manager) removeStaleJumps(ctx context.Context, binary, chain string, rules [][]string, desired [][]string) error {
 	for _, rule := range rules {
+		// Deleting by rule spec removes the first matching rule, so keep duplicate
+		// desired jumps in place instead of accidentally deleting the leading gate.
 		if !isManagedJump(rule, m.config.Chain) || containsRule(desired, rule) {
 			continue
 		}
@@ -543,22 +558,15 @@ func restoreInput(chain string, sources []string) string {
 	builder.WriteString("-F ")
 	builder.WriteString(chain)
 	builder.WriteByte('\n')
-	builder.WriteString("-A ")
-	builder.WriteString(chain)
-	builder.WriteString(" -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN\n")
-	builder.WriteString("-A ")
-	builder.WriteString(chain)
-	builder.WriteString(" -m conntrack --ctstate INVALID -j DROP\n")
-	for _, source := range sources {
+	for _, rule := range canonicalChainRules(sources) {
 		builder.WriteString("-A ")
 		builder.WriteString(chain)
-		builder.WriteString(" -s ")
-		builder.WriteString(source)
-		builder.WriteString(" -j RETURN\n")
+		for _, field := range rule {
+			builder.WriteByte(' ')
+			builder.WriteString(field)
+		}
+		builder.WriteByte('\n')
 	}
-	builder.WriteString("-A ")
-	builder.WriteString(chain)
-	builder.WriteString(" -j DROP\n")
 	builder.WriteString("COMMIT\n")
 	return builder.String()
 }
@@ -578,17 +586,6 @@ func isAlreadyExists(err error) bool {
 		text = commandErr.output
 	}
 	return strings.Contains(text, "Chain already exists") || strings.Contains(text, "File exists")
-}
-
-func isRuleMissing(err error) bool {
-	var commandErr commandError
-	text := err.Error()
-	if errors.As(err, &commandErr) {
-		text = commandErr.output
-	}
-	return strings.Contains(text, "Bad rule") ||
-		strings.Contains(text, "does a matching rule exist") ||
-		strings.Contains(text, "No chain/target/match by that name")
 }
 
 func isMissingChain(err error) bool {

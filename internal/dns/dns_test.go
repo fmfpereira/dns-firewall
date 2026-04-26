@@ -19,7 +19,10 @@ func TestSplitTXTValue(t *testing.T) {
 }
 
 func TestResolveDirectIP(t *testing.T) {
-	addresses := ResolveTXTValue(context.Background(), NewResolverGroup(nil), "192.0.2.10", "_allow.example.com")
+	addresses, err := ResolveTXTValue(context.Background(), NewResolverGroup(nil), "192.0.2.10", "_allow.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(addresses) != 1 {
 		t.Fatalf("got %v addresses, want 1", len(addresses))
 	}
@@ -29,7 +32,10 @@ func TestResolveDirectIP(t *testing.T) {
 }
 
 func TestResolveCIDR(t *testing.T) {
-	addresses := ResolveTXTValue(context.Background(), NewResolverGroup(nil), "192.0.2.9/24", "_allow.example.com")
+	addresses, err := ResolveTXTValue(context.Background(), NewResolverGroup(nil), "192.0.2.9/24", "_allow.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(addresses) != 1 {
 		t.Fatalf("got %v addresses, want 1", len(addresses))
 	}
@@ -39,9 +45,22 @@ func TestResolveCIDR(t *testing.T) {
 }
 
 func TestRejectInvalidValue(t *testing.T) {
-	addresses := ResolveTXTValue(context.Background(), NewResolverGroup(nil), "not_a_host!", "_allow.example.com")
+	addresses, err := ResolveTXTValue(context.Background(), NewResolverGroup(nil), "not_a_host!", "_allow.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(addresses) != 0 {
 		t.Fatalf("got %v, want no addresses", addresses)
+	}
+}
+
+func TestResolveHostnameFailureIsFatal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	addresses, err := ResolveTXTValue(ctx, NewResolverGroup(nil), "admin.example.com", "_allow.example.com")
+	if err == nil {
+		t.Fatalf("got addresses %v, want hostname lookup error", addresses)
 	}
 }
 

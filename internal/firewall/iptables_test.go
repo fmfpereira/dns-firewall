@@ -49,14 +49,14 @@ func TestIptablesErrorClassification(t *testing.T) {
 		t.Fatal("expected chain already exists error to be classified")
 	}
 
-	missingRule := commandError{output: "iptables: Bad rule (does a matching rule exist in that chain?).\n", err: errors.New("exit status 1")}
-	if !isRuleMissing(missingRule) {
-		t.Fatal("expected missing rule error to be classified")
+	missingChain := commandError{output: "iptables: No chain/target/match by that name.\n", err: errors.New("exit status 1")}
+	if !isMissingChain(missingChain) {
+		t.Fatal("expected missing chain error to be classified")
 	}
 
 	permissionDenied := commandError{output: "iptables: Permission denied (you must be root).\n", err: errors.New("exit status 4")}
-	if isRuleMissing(permissionDenied) {
-		t.Fatal("permission denied must not be classified as a missing rule")
+	if isMissingChain(permissionDenied) {
+		t.Fatal("permission denied must not be classified as a missing chain")
 	}
 }
 
@@ -267,6 +267,7 @@ type fakeIptables struct {
 	chainRules      map[string][][]string
 	calls           [][]string
 	restorePayloads []string
+	restoreErr      error
 }
 
 func (f *fakeIptables) commandFn(_ context.Context, binary string, args ...string) (string, error) {
@@ -299,6 +300,14 @@ func (f *fakeIptables) commandFn(_ context.Context, binary string, args ...strin
 		}
 		return f.dumpChain(chain), nil
 	case "-N":
+		if i+1 < len(args) {
+			if f.chainRules == nil {
+				f.chainRules = map[string][][]string{}
+			}
+			if _, ok := f.chainRules[args[i+1]]; !ok {
+				f.chainRules[args[i+1]] = nil
+			}
+		}
 		return "", nil
 	case "-F":
 		if i+1 < len(args) && f.chainRules != nil {
@@ -394,7 +403,11 @@ func (f *fakeIptables) dumpChain(chain string) string {
 	return b.String()
 }
 
-func (f *fakeIptables) restoreFn(_ context.Context, _ string, payload string) error {
+func (f *fakeIptables) restoreFn(_ context.Context, binary string, payload string) error {
+	f.calls = append(f.calls, []string{binary, "<restore>"})
+	if f.restoreErr != nil {
+		return f.restoreErr
+	}
 	f.restorePayloads = append(f.restorePayloads, payload)
 	return nil
 }
@@ -445,6 +458,60 @@ func TestApplyDryRunDoesNotRequireManagedChainToExist(t *testing.T) {
 	}
 }
 
+func TestApplyRestoresManagedChainBeforeAttachingJump(t *testing.T) {
+	fake := &fakeIptables{}
+	mgr := &Manager{
+		config:    config.FirewallConfig{Chain: "DNS_FW", Interfaces: []string{"eth0"}},
+		commandFn: fake.commandFn,
+		restoreFn: fake.restoreFn,
+	}
+
+	err := mgr.Apply(context.Background(), []dns.AllowedAddress{
+		{Family: dns.IPv4, Value: "192.0.2.10"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restoreIndex := -1
+	insertIndex := -1
+	for i, call := range fake.calls {
+		if len(call) >= 2 && call[0] == "iptables-restore" && call[1] == "<restore>" && restoreIndex == -1 {
+			restoreIndex = i
+		}
+		for _, arg := range call {
+			if call[0] == "iptables" && arg == "-I" && insertIndex == -1 {
+				insertIndex = i
+			}
+		}
+	}
+	if restoreIndex == -1 || insertIndex == -1 {
+		t.Fatalf("expected restore and insert calls, got %v", fake.calls)
+	}
+	if restoreIndex > insertIndex {
+		t.Fatalf("managed chain must be restored before inserting attach jump; calls: %v", fake.calls)
+	}
+}
+
+func TestApplyDoesNotAttachJumpWhenRestoreFails(t *testing.T) {
+	fake := &fakeIptables{restoreErr: errors.New("restore failed")}
+	mgr := &Manager{
+		config:    config.FirewallConfig{Chain: "DNS_FW", Interfaces: []string{"eth0"}},
+		commandFn: fake.commandFn,
+		restoreFn: fake.restoreFn,
+	}
+
+	err := mgr.Apply(context.Background(), []dns.AllowedAddress{
+		{Family: dns.IPv4, Value: "192.0.2.10"},
+	})
+	if err == nil {
+		t.Fatal("expected restore failure")
+	}
+	if len(fake.rules) != 0 {
+		t.Fatalf("INPUT jumps must not be inserted after restore failure: %v", fake.rules)
+	}
+}
+
 func TestEnsureJumpsAlreadyInSyncNoop(t *testing.T) {
 	fake := &fakeIptables{
 		rules: [][]string{{"-i", "eth0", "-j", "DNS_FW"}},
@@ -459,6 +526,37 @@ func TestEnsureJumpsAlreadyInSyncNoop(t *testing.T) {
 		for _, arg := range call {
 			if arg == "-I" || arg == "-D" {
 				t.Fatalf("expected only reads, got call %v", call)
+			}
+		}
+	}
+}
+
+func TestEnsureJumpsKeepsDuplicateDesiredJumpBehindUnmanagedRule(t *testing.T) {
+	fake := &fakeIptables{
+		rules: [][]string{
+			{"-i", "eth0", "-j", "DNS_FW"},
+			{"-p", "tcp", "--dport", "22", "-j", "ACCEPT"},
+			{"-i", "eth0", "-j", "DNS_FW"},
+		},
+	}
+	mgr := newTestManager(fake)
+
+	if err := mgr.ensureJumps(context.Background(), "iptables", []string{"eth0"}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := [][]string{
+		{"-i", "eth0", "-j", "DNS_FW"},
+		{"-p", "tcp", "--dport", "22", "-j", "ACCEPT"},
+		{"-i", "eth0", "-j", "DNS_FW"},
+	}
+	if !reflect.DeepEqual(fake.rules, want) {
+		t.Fatalf("rules got %v, want %v", fake.rules, want)
+	}
+	for _, call := range fake.calls {
+		for _, arg := range call {
+			if arg == "-D" {
+				t.Fatalf("must not delete duplicate desired jump by spec because it removes the leading gate first; got call %v", call)
 			}
 		}
 	}
@@ -677,7 +775,7 @@ func TestEnsureJumpsAttachesToExtraChainWhenPresent(t *testing.T) {
 	}
 }
 
-func TestEnsureJumpsSkipsMissingExtraChain(t *testing.T) {
+func TestEnsureJumpsFailsWhenConfiguredExtraChainIsMissing(t *testing.T) {
 	fake := &fakeIptables{}
 	mgr := &Manager{
 		config: config.FirewallConfig{
@@ -688,24 +786,18 @@ func TestEnsureJumpsSkipsMissingExtraChain(t *testing.T) {
 		restoreFn: fake.restoreFn,
 	}
 
-	if err := mgr.ensureJumps(context.Background(), "iptables", []string{"eth0"}); err != nil {
-		t.Fatalf("missing extra chain must not fail apply: %v", err)
+	if err := mgr.ensureJumps(context.Background(), "iptables", []string{"eth0"}); err == nil {
+		t.Fatal("missing configured extra chain must fail")
 	}
-
-	wantInput := [][]string{{"-i", "eth0", "-j", "DNS_FW"}}
-	if !reflect.DeepEqual(fake.rules, wantInput) {
-		t.Fatalf("INPUT rules got %v, want %v", fake.rules, wantInput)
+	if len(fake.rules) != 0 {
+		t.Fatalf("INPUT jumps must not be inserted when configured extra chain is missing: %v", fake.rules)
 	}
 	if _, ok := fake.chainRules["DOCKER-USER"]; ok {
 		t.Fatal("missing chain must not be created by the manager")
 	}
 }
 
-func TestEnsureJumpsTracksMissingChainStateAcrossCalls(t *testing.T) {
-	missingChainStateMu.Lock()
-	missingChainState = map[string]bool{}
-	missingChainStateMu.Unlock()
-
+func TestApplyFailsBeforeChangingRulesWhenConfiguredExtraChainIsMissing(t *testing.T) {
 	fake := &fakeIptables{}
 	mgr := &Manager{
 		config: config.FirewallConfig{
@@ -716,29 +808,62 @@ func TestEnsureJumpsTracksMissingChainStateAcrossCalls(t *testing.T) {
 		restoreFn: fake.restoreFn,
 	}
 
-	if err := mgr.ensureJumps(context.Background(), "iptables", []string{"eth0"}); err != nil {
-		t.Fatalf("first apply with missing chain must succeed: %v", err)
+	err := mgr.Apply(context.Background(), []dns.AllowedAddress{
+		{Family: dns.IPv4, Value: "192.0.2.10"},
+	})
+	if err == nil {
+		t.Fatal("missing configured extra chain must fail apply")
 	}
-	missingChainStateMu.Lock()
-	marked := missingChainState["iptables/DOCKER-USER"]
-	missingChainStateMu.Unlock()
-	if !marked {
-		t.Fatal("missing chain must be tracked after first encounter so warns are rate-limited")
+	if len(fake.restorePayloads) != 0 {
+		t.Fatalf("restore must not run when configured extra chain is missing: %v", fake.restorePayloads)
+	}
+	if len(fake.rules) != 0 {
+		t.Fatalf("INPUT jumps must not be inserted when configured extra chain is missing: %v", fake.rules)
+	}
+}
+
+func TestApplyPreflightsBothFamiliesBeforeChangingRules(t *testing.T) {
+	fake := &fakeIptables{
+		chainRules: map[string][][]string{
+			"DOCKER-USER": nil,
+		},
+	}
+	commandFn := func(ctx context.Context, binary string, args ...string) (string, error) {
+		i := 0
+		if i < len(args) && args[i] == "-w" {
+			i++
+		}
+		if binary == "ip6tables" && i+1 < len(args) && args[i] == "-S" && args[i+1] == "DOCKER-USER" {
+			return "", commandError{
+				binary: binary,
+				args:   append([]string(nil), args...),
+				output: "ip6tables: No chain/target/match by that name.",
+				err:    errors.New("exit status 1"),
+			}
+		}
+		return fake.commandFn(ctx, binary, args...)
+	}
+	mgr := &Manager{
+		config: config.FirewallConfig{
+			Chain:             "DNS_FW",
+			Interfaces:        []string{"eth0"},
+			ExtraAttachChains: []string{"DOCKER-USER"},
+		},
+		commandFn: commandFn,
+		restoreFn: fake.restoreFn,
 	}
 
-	if err := mgr.ensureJumps(context.Background(), "iptables", []string{"eth0"}); err != nil {
-		t.Fatalf("second apply with missing chain must succeed: %v", err)
+	err := mgr.Apply(context.Background(), []dns.AllowedAddress{
+		{Family: dns.IPv4, Value: "192.0.2.10"},
+	})
+	if err == nil {
+		t.Fatal("missing configured IPv6 extra chain must fail apply")
 	}
-
-	fake.chainRules = map[string][][]string{"DOCKER-USER": nil}
-	if err := mgr.ensureJumps(context.Background(), "iptables", []string{"eth0"}); err != nil {
-		t.Fatal(err)
+	if len(fake.restorePayloads) != 0 {
+		t.Fatalf("restore must not run before both families pass preflight: %v", fake.restorePayloads)
 	}
-	missingChainStateMu.Lock()
-	stillMarked := missingChainState["iptables/DOCKER-USER"]
-	missingChainStateMu.Unlock()
-	if stillMarked {
-		t.Fatal("missing chain state must clear once the chain appears, so a future absence warns again")
+	if len(fake.rules) != 0 {
+		t.Fatalf("INPUT jumps must not be inserted before both families pass preflight: %v", fake.rules)
 	}
 }
 
