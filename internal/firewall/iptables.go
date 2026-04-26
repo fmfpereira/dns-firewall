@@ -27,6 +27,7 @@ type Manager struct {
 	config    config.FirewallConfig
 	dryRun    bool
 	commandFn func(ctx context.Context, binary string, args ...string) (string, error)
+	restoreFn func(ctx context.Context, binary string, payload string) error
 }
 
 const (
@@ -81,9 +82,20 @@ func (m *Manager) applyFamily(ctx context.Context, binary string, family dns.Fam
 		return err
 	}
 	added, removed := sourceDiff(state.sources, desired)
-	if len(added) == 0 && len(removed) == 0 && state.terminalDrop {
+	canonical := state.terminalDrop && state.conntrackReturn && state.invalidDrop
+	if len(added) == 0 && len(removed) == 0 && canonical {
 		slog.Info("firewall already in sync", "binary", binary, "chain", m.config.Chain, "rules", len(desired))
 		return nil
+	}
+	if !canonical {
+		slog.Info(
+			"rewriting managed chain to canonical layout",
+			"binary", binary,
+			"chain", m.config.Chain,
+			"conntrack_return", state.conntrackReturn,
+			"invalid_drop", state.invalidDrop,
+			"terminal_drop", state.terminalDrop,
+		)
 	}
 	slog.Info(
 		"firewall change detected",
@@ -92,6 +104,8 @@ func (m *Manager) applyFamily(ctx context.Context, binary string, family dns.Fam
 		"desired_rules", len(desired),
 		"current_rules", len(state.sources),
 		"terminal_drop", state.terminalDrop,
+		"conntrack_return", state.conntrackReturn,
+		"invalid_drop", state.invalidDrop,
 		"added", len(added),
 		"removed", len(removed),
 	)
@@ -241,9 +255,16 @@ func (m *Manager) flushManagedChain(ctx context.Context, binary string) error {
 }
 
 type chainState struct {
-	sources      []string
-	terminalDrop bool
+	sources         []string
+	terminalDrop    bool
+	conntrackReturn bool
+	invalidDrop     bool
 }
+
+var (
+	conntrackReturnStates = []string{"ESTABLISHED", "RELATED"}
+	invalidDropStates     = []string{"INVALID"}
+)
 
 func (m *Manager) currentState(ctx context.Context, binary string) (chainState, error) {
 	output, err := m.output(ctx, binary, "-w", "-S", m.config.Chain)
@@ -271,9 +292,34 @@ func managedChainState(output string, chain string) chainState {
 		}
 	}
 	return chainState{
-		sources:      sortedKeys(seen),
-		terminalDrop: len(rules) > 0 && ruleEquals(rules[len(rules)-1], []string{"-j", "DROP"}),
+		sources:         sortedKeys(seen),
+		terminalDrop:    len(rules) > 0 && ruleEquals(rules[len(rules)-1], []string{"-j", "DROP"}),
+		conntrackReturn: len(rules) > 0 && matchesConntrackRule(rules[0], conntrackReturnStates, "RETURN"),
+		invalidDrop:     len(rules) > 1 && matchesConntrackRule(rules[1], invalidDropStates, "DROP"),
 	}
+}
+
+func matchesConntrackRule(fields []string, wantStates []string, wantTarget string) bool {
+	if len(fields) != 6 {
+		return false
+	}
+	if fields[0] != "-m" || fields[1] != "conntrack" || fields[2] != "--ctstate" {
+		return false
+	}
+	if fields[4] != "-j" || fields[5] != wantTarget {
+		return false
+	}
+	got := strings.Split(fields[3], ",")
+	if len(got) != len(wantStates) {
+		return false
+	}
+	gotSet := toSet(got)
+	for _, state := range wantStates {
+		if _, ok := gotSet[state]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Manager) output(ctx context.Context, binary string, args ...string) (string, error) {
@@ -292,6 +338,9 @@ func (m *Manager) restoreRules(ctx context.Context, binary string, sources []str
 	if m.dryRun {
 		slog.Info("dry-run firewall restore command", "command", append([]string{restoreBinary}, restoreArgs...), "input", payload)
 		return nil
+	}
+	if m.restoreFn != nil {
+		return m.restoreFn(ctx, restoreBinary, payload)
 	}
 
 	cmd := exec.CommandContext(ctx, restoreBinary, restoreArgs...)
@@ -398,6 +447,12 @@ func restoreInput(chain string, sources []string) string {
 	builder.WriteString("-F ")
 	builder.WriteString(chain)
 	builder.WriteByte('\n')
+	builder.WriteString("-A ")
+	builder.WriteString(chain)
+	builder.WriteString(" -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN\n")
+	builder.WriteString("-A ")
+	builder.WriteString(chain)
+	builder.WriteString(" -m conntrack --ctstate INVALID -j DROP\n")
 	for _, source := range sources {
 		builder.WriteString("-A ")
 		builder.WriteString(chain)

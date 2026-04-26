@@ -63,6 +63,8 @@ func TestRestoreInput(t *testing.T) {
 	got := restoreInput("DNS_FIREWALL_ALLOW", []string{"192.0.2.10", "198.51.100.0/24"})
 	want := "*filter\n" +
 		"-F DNS_FIREWALL_ALLOW\n" +
+		"-A DNS_FIREWALL_ALLOW -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN\n" +
+		"-A DNS_FIREWALL_ALLOW -m conntrack --ctstate INVALID -j DROP\n" +
 		"-A DNS_FIREWALL_ALLOW -s 192.0.2.10 -j RETURN\n" +
 		"-A DNS_FIREWALL_ALLOW -s 198.51.100.0/24 -j RETURN\n" +
 		"-A DNS_FIREWALL_ALLOW -j DROP\n" +
@@ -74,7 +76,9 @@ func TestRestoreInput(t *testing.T) {
 }
 
 func TestManagedChainStateRequiresReturnAndTerminalDrop(t *testing.T) {
-	output := "-A DNS_FIREWALL_ALLOW -s 192.0.2.10 -j RETURN\n" +
+	output := "-A DNS_FIREWALL_ALLOW -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN\n" +
+		"-A DNS_FIREWALL_ALLOW -m conntrack --ctstate INVALID -j DROP\n" +
+		"-A DNS_FIREWALL_ALLOW -s 192.0.2.10 -j RETURN\n" +
 		"-A DNS_FIREWALL_ALLOW -s 198.51.100.0/24 -j ACCEPT\n" +
 		"-A DNS_FIREWALL_ALLOW -j DROP\n"
 
@@ -85,6 +89,76 @@ func TestManagedChainStateRequiresReturnAndTerminalDrop(t *testing.T) {
 	}
 	if !state.terminalDrop {
 		t.Fatal("expected terminal drop")
+	}
+	if !state.conntrackReturn {
+		t.Fatal("expected conntrack return rule at top")
+	}
+	if !state.invalidDrop {
+		t.Fatal("expected conntrack INVALID drop after the RETURN")
+	}
+}
+
+func TestRestoreInputRoundTripIsCanonical(t *testing.T) {
+	sources := []string{"192.0.2.10", "198.51.100.0/24"}
+	state := managedChainState(restoreInput("DNS_FW", sources), "DNS_FW")
+	if !state.conntrackReturn {
+		t.Fatal("rendered chain must be recognized as having conntrack RETURN")
+	}
+	if !state.invalidDrop {
+		t.Fatal("rendered chain must be recognized as having INVALID DROP")
+	}
+	if !state.terminalDrop {
+		t.Fatal("rendered chain must be recognized as having terminal DROP")
+	}
+	if !reflect.DeepEqual(state.sources, sources) {
+		t.Fatalf("round-trip sources got %v, want %v", state.sources, sources)
+	}
+}
+
+func TestManagedChainStateAcceptsEitherCtstateOrder(t *testing.T) {
+	cases := map[string]string{
+		"iptables canonical print order": "-A DNS_FIREWALL_ALLOW -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN\n" +
+			"-A DNS_FIREWALL_ALLOW -m conntrack --ctstate INVALID -j DROP\n" +
+			"-A DNS_FIREWALL_ALLOW -j DROP\n",
+		"reversed ctstate ordering": "-A DNS_FIREWALL_ALLOW -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN\n" +
+			"-A DNS_FIREWALL_ALLOW -m conntrack --ctstate INVALID -j DROP\n" +
+			"-A DNS_FIREWALL_ALLOW -j DROP\n",
+	}
+	for name, output := range cases {
+		state := managedChainState(output, "DNS_FIREWALL_ALLOW")
+		if !state.conntrackReturn {
+			t.Fatalf("%s: expected conntrack return to be detected", name)
+		}
+		if !state.invalidDrop {
+			t.Fatalf("%s: expected invalid drop to be detected", name)
+		}
+	}
+}
+
+func TestManagedChainStateMissingConntrackReturn(t *testing.T) {
+	output := "-A DNS_FIREWALL_ALLOW -s 192.0.2.10 -j RETURN\n" +
+		"-A DNS_FIREWALL_ALLOW -j DROP\n"
+
+	state := managedChainState(output, "DNS_FIREWALL_ALLOW")
+	if state.conntrackReturn {
+		t.Fatal("expected conntrack return to be missing for legacy chain layout")
+	}
+	if state.invalidDrop {
+		t.Fatal("expected invalid drop to be missing for legacy chain layout")
+	}
+}
+
+func TestManagedChainStateMissingInvalidDrop(t *testing.T) {
+	output := "-A DNS_FIREWALL_ALLOW -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN\n" +
+		"-A DNS_FIREWALL_ALLOW -s 192.0.2.10 -j RETURN\n" +
+		"-A DNS_FIREWALL_ALLOW -j DROP\n"
+
+	state := managedChainState(output, "DNS_FIREWALL_ALLOW")
+	if !state.conntrackReturn {
+		t.Fatal("expected conntrack return present")
+	}
+	if state.invalidDrop {
+		t.Fatal("expected invalid drop to be missing when not yet rolled out")
 	}
 }
 
@@ -181,8 +255,10 @@ func TestRestoreArgsWaitForXtablesLock(t *testing.T) {
 }
 
 type fakeIptables struct {
-	rules [][]string
-	calls [][]string
+	rules           [][]string
+	chainRules      map[string][][]string
+	calls           [][]string
+	restorePayloads []string
 }
 
 func (f *fakeIptables) commandFn(_ context.Context, binary string, args ...string) (string, error) {
@@ -198,7 +274,17 @@ func (f *fakeIptables) commandFn(_ context.Context, binary string, args ...strin
 
 	switch args[i] {
 	case "-S":
+		if i+1 < len(args) && args[i+1] != "INPUT" {
+			return f.dumpChain(args[i+1]), nil
+		}
 		return f.dump(), nil
+	case "-N":
+		return "", nil
+	case "-F":
+		if i+1 < len(args) && f.chainRules != nil {
+			delete(f.chainRules, args[i+1])
+		}
+		return "", nil
 	case "-I":
 		if i+3 > len(args) {
 			return "", nil
@@ -252,10 +338,30 @@ func (f *fakeIptables) dump() string {
 	return b.String()
 }
 
+func (f *fakeIptables) dumpChain(chain string) string {
+	var b strings.Builder
+	for _, rule := range f.chainRules[chain] {
+		b.WriteString("-A ")
+		b.WriteString(chain)
+		for _, field := range rule {
+			b.WriteString(" ")
+			b.WriteString(field)
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func (f *fakeIptables) restoreFn(_ context.Context, _ string, payload string) error {
+	f.restorePayloads = append(f.restorePayloads, payload)
+	return nil
+}
+
 func newTestManager(fake *fakeIptables) *Manager {
 	return &Manager{
 		config:    config.FirewallConfig{Chain: "DNS_FW"},
 		commandFn: fake.commandFn,
+		restoreFn: fake.restoreFn,
 	}
 }
 
@@ -345,6 +451,43 @@ func TestEnsureJumpsInsertsBeforeRemovingStale(t *testing.T) {
 	}
 	if firstWriteOp != "-I" {
 		t.Fatalf("first write op was %q; expected insert before delete to avoid ungated window", firstWriteOp)
+	}
+}
+
+func TestApplyMigratesLegacyChainLayout(t *testing.T) {
+	legacy := [][]string{
+		{"-s", "192.0.2.10", "-j", "RETURN"},
+		{"-j", "DROP"},
+	}
+	fake := &fakeIptables{
+		rules: [][]string{{"-i", "eth0", "-j", "DNS_FW"}},
+		chainRules: map[string][][]string{
+			"DNS_FW": legacy,
+		},
+	}
+	mgr := &Manager{
+		config:    config.FirewallConfig{Chain: "DNS_FW", Interfaces: []string{"eth0"}},
+		commandFn: fake.commandFn,
+		restoreFn: fake.restoreFn,
+	}
+
+	err := mgr.Apply(context.Background(), []dns.AllowedAddress{
+		{Family: dns.IPv4, Value: "192.0.2.10"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(fake.restorePayloads) == 0 {
+		t.Fatal("expected restore to run for legacy chain rewrite")
+	}
+	for _, payload := range fake.restorePayloads {
+		if !strings.Contains(payload, "-A DNS_FW -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN") {
+			t.Fatalf("restore payload missing conntrack RETURN:\n%s", payload)
+		}
+		if !strings.Contains(payload, "-A DNS_FW -m conntrack --ctstate INVALID -j DROP") {
+			t.Fatalf("restore payload missing INVALID DROP:\n%s", payload)
+		}
 	}
 }
 

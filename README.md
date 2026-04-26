@@ -71,7 +71,7 @@ The service attaches the managed chain to `INPUT` at position `1` for each detec
 
 If no default route exists for an IP family, the service removes its managed `INPUT` jumps for that family so stale public-interface gates are not left behind.
 
-The gate is enforced per family. If your TXT records resolve to IPv4 addresses only, all inbound IPv6 on the gated interface is dropped (and vice versa). On dual-stack hosts, either include both families in the allowlist or accept that the unlisted family will be blocked on the public interface.
+The gate is enforced per family for new inbound connections. If your TXT records resolve to IPv4 addresses only, new inbound IPv6 connections on the gated interface are dropped (and vice versa); reply traffic for outbound IPv6 connections still flows via the conntrack rule. On dual-stack hosts, either include both families in the allowlist or accept that new inbound on the unlisted family will be blocked on the public interface.
 
 ## Install From A Release
 
@@ -89,9 +89,12 @@ checksums.txt
 Example for `linux_amd64`:
 
 ```bash
-VERSION=v0.1.0
-curl -LO "https://github.com/<owner>/dns-firewall/releases/download/${VERSION}/dns-firewall_${VERSION}_linux_amd64.tar.gz"
-curl -LO "https://github.com/<owner>/dns-firewall/releases/download/${VERSION}/checksums.txt"
+OWNER=your-github-owner
+# Pick the latest release tag, or replace with a specific tag (e.g. VERSION=v0.3.0) to pin.
+VERSION=$(curl -fsSL "https://api.github.com/repos/${OWNER}/dns-firewall/releases/latest" \
+  | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+curl -LO "https://github.com/${OWNER}/dns-firewall/releases/download/${VERSION}/dns-firewall_${VERSION}_linux_amd64.tar.gz"
+curl -LO "https://github.com/${OWNER}/dns-firewall/releases/download/${VERSION}/checksums.txt"
 sha256sum -c checksums.txt --ignore-missing
 tar -xzf "dns-firewall_${VERSION}_linux_amd64.tar.gz"
 ```
@@ -157,11 +160,13 @@ The service creates a dedicated chain and inserts a jump to it from `INPUT`:
 
 ```text
 INPUT -i <internet-interface> -> DNS_FIREWALL_ALLOW
+DNS_FIREWALL_ALLOW -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+DNS_FIREWALL_ALLOW -m conntrack --ctstate INVALID -j DROP
 DNS_FIREWALL_ALLOW -s <resolved-ip> -j RETURN
 DNS_FIREWALL_ALLOW -j DROP
 ```
 
-The DNS allowlist is a first gate, not the final allow decision. A matching source returns to `INPUT` so later firewall rules are still evaluated. A non-matching source on a configured internet-facing interface is dropped before later rules run.
+The DNS allowlist is a first gate, not the final allow decision. The leading conntrack rule lets reply traffic for outbound connections through, so the gate only filters new inbound connections. The explicit `INVALID` drop accounts for malformed or out-of-window packets in `iptables -L -v` counters instead of folding them into the catch-all. A matching new connection from an allowlisted source returns to `INPUT` so later firewall rules are still evaluated. New inbound connections from non-matching sources on a configured internet-facing interface are dropped before later rules run.
 
 It updates only `DNS_FIREWALL_ALLOW`, using `iptables-restore --noflush` / `ip6tables-restore --noflush` so the managed chain rewrite is applied as one transaction. The service also keeps its `INPUT` jump rules first and removes stale jumps to the managed chain when the detected or configured interface list changes.
 
