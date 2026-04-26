@@ -14,6 +14,20 @@ Runtime requirements:
 - `ip` from `iproute2` for default-route interface detection
 - `systemd` for running as a Linux service
 
+## Release Maturity
+
+This is an initial conservative release. The service is designed to fail closed for non-allowlisted new inbound traffic, but to fail safe during DNS or configuration problems by keeping the last known firewall state instead of applying an empty or partial allowlist.
+
+Before using it broadly, validate it on one host with the same network shape as production:
+
+1. Run `--once --dry-run` and check the planned managed chain.
+2. Run `--once` and inspect `iptables -S` and `ip6tables -S`.
+3. Confirm allowed sources still pass through your normal host, Docker, or Podman rules.
+4. Confirm non-allowlisted new inbound traffic is dropped on the intended interfaces.
+5. Confirm outbound connections from the host still work.
+
+For Docker or Podman deployments, start the container runtime first and confirm the configured extra attach chain exists for the IP families you use. Treat the first rollout as a controlled change: keep console or out-of-band access available, verify both IPv4 and IPv6 behavior, and only then enable the long-running systemd service.
+
 ## How It Works
 
 On each sync, the service:
